@@ -1,0 +1,15 @@
+# Python dependencies for Tenable Nessus Scripts
+# Install with: pip install -r requirements.txt
+
+# System and process monitoring
+psutil>=5.9.0
+
+# SQL Server database connectivity (for nessus_to_sql.py)
+pyodbc>=4.0.39
+
+# Excel file creation (for nessus_to_xlsx.py)
+openpyxl>=3.1.0
+
+# HTTP requests for Tenable.io API (for tenable_scan_retrieval.py)
+requests>=2.31.0
+
