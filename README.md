@@ -14,6 +14,7 @@ This repository contains four main scripts:
 ## Features
 
 ### Common Features (All Conversion Scripts)
+
 - Processes one or more .nessus files
 - Extracts comprehensive vulnerability data including:
   - Host information (IP, hostname, FQDN, MAC address, OS details)
@@ -28,6 +29,7 @@ This repository contains four main scripts:
 ### Script-Specific Features
 
 #### `tenable_scan_retrieval.py`
+
 - Authenticates with Tenable.io using API keys
 - Interactive scan selection (single, multiple, or all scans)
 - Automatic export initiation and status monitoring
@@ -36,17 +38,20 @@ This repository contains four main scripts:
 - Progress tracking with download speed metrics
 
 #### `nessus_to_csv.py`
+
 - Supports processing individual files or entire folders
 - Interactive file/folder selection via GUI
 - Outputs to CSV format for spreadsheet applications
 - UTF-8 encoding support
 
 #### `nessus_to_xlsx.py`
+
 - Creates formatted Excel tables with professional styling
 - Alternating row colors for improved readability
 - Excel table formatting with filters
 
 #### `nessus_to_sql.py`
+
 - Interactive SQL Server connection setup
 - Queries available servers, databases, and tables
 - Automatic table creation with proper schema
@@ -70,6 +75,7 @@ pip install -r requirements.txt
 ### Additional Setup for SQL Script
 
 For `nessus_to_sql.py`, you'll also need:
+
 - SQL Server with ODBC Driver 18 for SQL Server installed
 - Appropriate database permissions to create tables and insert data
 
@@ -82,6 +88,7 @@ python tenable_scan_retrieval.py
 ```
 
 **Steps:**
+
 1. Enter your Tenable.io API credentials (Access Key and Secret Key)
 2. View the list of available scans
 3. Select scans to download (enter numbers, comma-separated numbers, or "all")
@@ -89,6 +96,7 @@ python tenable_scan_retrieval.py
 5. Files are saved in organized date-based directories
 
 **API Credentials:**
+
 - Find your API keys in Tenable.io: Settings > My Account > API Keys
 
 ### Converting to CSV
@@ -98,6 +106,7 @@ python nessus_to_csv.py
 ```
 
 **Steps:**
+
 1. Choose to select individual files (1) or a folder (2)
 2. Select .nessus files or folder containing .nessus files
 3. Choose output location and filename
@@ -110,6 +119,7 @@ python nessus_to_xlsx.py
 ```
 
 **Steps:**
+
 1. Select one or more .nessus files via file dialog
 2. Choose output location and filename
 3. Script processes files and creates formatted Excel workbook
@@ -121,6 +131,7 @@ python nessus_to_sql.py
 ```
 
 **Steps:**
+
 1. Select folder containing .nessus files
 2. Enter SQL Server address (e.g., localhost, 10.10.30.20, or server.domain.com)
 3. Select database from available list
@@ -135,12 +146,14 @@ python nessus_to_sql.py
 All scripts extract the following comprehensive data fields:
 
 ### Host Information
+
 - IP Address, MAC Address, Virtual MAC Address
 - Hostname, NetBIOS Name, FQDN, RDNS
 - System Type, Operating System details
 - CPE (Common Platform Enumeration)
 
 ### Vulnerability Details
+
 - Plugin ID, Plugin Family, Plugin Name
 - Severity Rating (Critical, High, Medium, Low, Informational)
 - Risk Factor, Synopsis, Description, Solution
@@ -149,6 +162,7 @@ All scripts extract the following comprehensive data fields:
 - Publication and Modification Dates
 
 ### CVSS Scores
+
 - CVSS Base Score, Vector, Score Rationale, Score Source
 - CVSS Temporal Score and Vector
 - CVSS3 Base Score, Vector, Score Source
@@ -157,6 +171,7 @@ All scripts extract the following comprehensive data fields:
 - VPR Score
 
 ### CVE and Security References
+
 - CVE (Common Vulnerabilities and Exposures)
 - CWE (Common Weakness Enumeration)
 - CISA Known Exploited, CISA NCAS
@@ -165,6 +180,7 @@ All scripts extract the following comprehensive data fields:
 - Bug IDs (BID, EDB-ID, etc.)
 
 ### Exploit Information
+
 - Exploit Available, Exploitability Ease
 - Exploit Code Maturity
 - Exploit Framework (Metasploit, Canvas, Core Impact)
@@ -172,6 +188,7 @@ All scripts extract the following comprehensive data fields:
 - Exploited by Malware, Exploited by Nessus
 
 ### Scan Metadata
+
 - Scan Date, Host Start/End Times
 - Policy Used, Credentialed Scan Status
 - Local Checks Protocol, SMB Login Used
@@ -180,17 +197,20 @@ All scripts extract the following comprehensive data fields:
 ## Output Formats
 
 ### CSV Output
+
 - UTF-8 encoded CSV file
 - All fields included as columns
 - Suitable for import into any spreadsheet application
 
 ### Excel Output
+
 - Formatted Excel table with alternating row colors
 - Professional styling (TableStyleMedium2)
 - All fields included as columns
 - Excel filters enabled
 
 ### SQL Server Output
+
 - Comprehensive table schema with appropriate data types
 - Batch insertion for performance
 - Supports large datasets efficiently
@@ -198,6 +218,7 @@ All scripts extract the following comprehensive data fields:
 ## Performance
 
 All scripts include performance metrics:
+
 - Elapsed processing time
 - Peak CPU usage
 - Peak memory usage
@@ -230,4 +251,3 @@ Contributions, issues, and feature requests are welcome!
 ## Disclaimer
 
 These scripts are provided as-is for security professionals to process vulnerability scan data. Ensure you have proper authorization before processing any scan results, and follow your organization's data handling policies.
-

@@ -24,7 +24,7 @@ import time
 import tkinter as tk
 from tkinter import filedialog
 import psutil
-import pyodbc
+import pyodbc  # type: ignore[import-not-found]
 from datetime import datetime
 
 # Create a file dialog window for the user to select a folder.
