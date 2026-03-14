@@ -49,15 +49,6 @@ def get_api_credentials():
     print()
     return access_key, secret_key
 
-# Get API credentials at runtime
-ACCESS_KEY, SECRET_KEY = get_api_credentials()
-
-HEADERS = {
-    "X-ApiKeys": f"accessKey={ACCESS_KEY}; secretKey={SECRET_KEY};",
-    "Accept": "application/json",
-    "Content-Type": "application/json"
-}
-
 # Get current date info
 current_date = datetime.datetime.now()
 year = current_date.strftime("%Y")  # Four-digit year (e.g., "2025")
@@ -89,21 +80,24 @@ def sanitize_filename(filename):
     """
     return re.sub(r'[\/:*?"<>|]', '_', filename)  # Replace special characters with "_"
 
-def get_all_scans():
+def get_all_scans(headers):
     """
     Fetches all available vulnerability scans from Tenable.io.
-    
+
     Connects to the Tenable.io API to retrieve a list of all scans accessible
     with the provided API credentials. This includes all scan types (scheduled,
     on-demand, etc.) that the authenticated user has access to.
-    
+
+    Args:
+        headers: HTTP headers dict with API authentication keys
+
     Returns:
         A list of scan dictionaries containing scan metadata (id, name, etc.)
         Returns an empty list if the API call fails
     """
     scans_url = "https://cloud.tenable.com/scans"
     try:
-        response = requests.get(scans_url, headers=HEADERS)
+        response = requests.get(scans_url, headers=headers)
         response.raise_for_status()  # Raise an exception for bad status codes
         scans = response.json().get("scans", [])  # Extract scans array from JSON response
         logging.info(f"Found {len(scans)} scans.")
@@ -112,24 +106,25 @@ def get_all_scans():
         logging.error(f"Error fetching scans: {e}")
         return []
 
-def initiate_export(scan_id):
+def initiate_export(scan_id, headers):
     """
     Initiates an export request for a specific scan in .nessus format.
-    
+
     Tenable.io exports are asynchronous - this function starts the export process
     and returns a file_id that can be used to check status and download the file
     once the export is complete.
-    
+
     Args:
         scan_id: The unique identifier of the scan to export
-        
+        headers: HTTP headers dict with API authentication keys
+
     Returns:
         The file_id string if export was initiated successfully, None otherwise
     """
     export_url = f"https://cloud.tenable.com/scans/{scan_id}/export"
     try:
         # Request export in .nessus format (XML format used by Nessus/Tenable)
-        response = requests.post(export_url, headers=HEADERS, json={"format": "nessus"})
+        response = requests.post(export_url, headers=headers, json={"format": "nessus"})
         response.raise_for_status()
         file_id = response.json().get("file")  # Extract file_id from response
         if file_id:
@@ -141,27 +136,28 @@ def initiate_export(scan_id):
         logging.error(f"Error initiating export for scan {scan_id}: {e}")
     return None
 
-def wait_for_export(scan_id, file_id, max_retries=30, wait_time=5):
+def wait_for_export(scan_id, file_id, headers, max_retries=30, wait_time=5):
     """
     Polls the export status until the scan export is ready for download.
-    
+
     Since Tenable.io exports are asynchronous, this function periodically checks
     the export status until it becomes "ready". This prevents attempting to download
     a file that hasn't finished exporting yet.
-    
+
     Args:
         scan_id: The unique identifier of the scan being exported
         file_id: The file identifier returned from initiate_export()
+        headers: HTTP headers dict with API authentication keys
         max_retries: Maximum number of status check attempts (default: 30)
         wait_time: Seconds to wait between status checks (default: 5)
-        
+
     Returns:
         True if export is ready, False if timeout is reached
     """
     status_url = f"https://cloud.tenable.com/scans/{scan_id}/export/{file_id}/status"
     for attempt in range(max_retries):
         try:
-            response = requests.get(status_url, headers=HEADERS)
+            response = requests.get(status_url, headers=headers)
             response.raise_for_status()
             status = response.json().get("status")
             if status == "ready":
@@ -174,19 +170,20 @@ def wait_for_export(scan_id, file_id, max_retries=30, wait_time=5):
     logging.error(f"Export did not complete for scan {scan_id}. Skipping.")
     return False
 
-def download_scan(scan_id, scan_name, file_id):
+def download_scan(scan_id, scan_name, file_id, headers):
     """
     Downloads the exported .nessus scan file with progress tracking.
-    
+
     Downloads the completed export file in chunks to handle large files efficiently.
     Displays real-time progress including percentage complete and download speed.
     Files are saved to the date-organized output directory.
-    
+
     Args:
         scan_id: The unique identifier of the scan
         scan_name: The name of the scan (used for filename)
         file_id: The file identifier from the export process
-        
+        headers: HTTP headers dict with API authentication keys
+
     Returns:
         The path to the downloaded file if successful, None otherwise
     """
@@ -196,7 +193,7 @@ def download_scan(scan_id, scan_name, file_id):
 
     try:
         start_time = time.time()  # Start timing
-        response = requests.get(download_url, headers=HEADERS, stream=True)
+        response = requests.get(download_url, headers=headers, stream=True)
         response.raise_for_status()
 
         total_size = int(response.headers.get("Content-Length", 0))
@@ -345,10 +342,18 @@ def main():
        - Waits for export to complete
        - Downloads the exported .nessus file
     """
+    # Get API credentials at runtime (inside main to avoid prompting on import)
+    access_key, secret_key = get_api_credentials()
+    headers = {
+        "X-ApiKeys": f"accessKey={access_key}; secretKey={secret_key};",
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
     print("\n" + "=" * 60)
     print("Fetching Scans from Tenable.io")
     print("=" * 60)
-    scans = get_all_scans()
+    scans = get_all_scans(headers)
     
     if not scans:
         logging.info("No scans found. Exiting.")
@@ -371,14 +376,14 @@ def main():
         logging.info(f"Processing scan: {scan_name} (ID: {scan_id})")
         
         # Step 1: Initiate export request
-        file_id = initiate_export(scan_id)
+        file_id = initiate_export(scan_id, headers)
         if not file_id:
             continue  # Skip to next scan if export initiation failed
-        
+
         # Step 2: Wait for export to complete
-        if wait_for_export(scan_id, file_id):
+        if wait_for_export(scan_id, file_id, headers):
             # Step 3: Download the completed export
-            download_scan(scan_id, scan_name, file_id)
+            download_scan(scan_id, scan_name, file_id, headers)
 
 if __name__ == "__main__":
     main()

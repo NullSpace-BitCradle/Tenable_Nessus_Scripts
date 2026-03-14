@@ -60,7 +60,7 @@ This repository contains four main scripts:
 
 ## Requirements
 
-- Python 3.6 or higher
+- Python 3.9 or higher
 - See `requirements.txt` for Python package dependencies
 
 ## Installation
