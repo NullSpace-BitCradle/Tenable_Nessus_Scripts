@@ -19,6 +19,9 @@ them (the secret key is not shown as you type). They are never written to disk.
 
 Set TENABLE_URL to use another Tenable cloud, for example https://fedcloud.tenable.com.
 
+Each scan's export is polled every 5 seconds for up to 900 seconds. Change that with
+--export-timeout SECONDS and --poll-interval SECONDS for very large scans.
+
 Each download goes to a .part file and is renamed only when it is complete, so
 an interrupted download never leaves a truncated .nessus behind. Files are named
 <scan name>-<scan id>.nessus so two scans with the same name do not overwrite
@@ -29,6 +32,7 @@ import argparse
 import datetime
 import getpass
 import logging
+import math
 import os
 import re
 import sys
@@ -45,6 +49,8 @@ DEFAULT_BASE_URL = "https://cloud.tenable.com"
 TIMEOUT = (10, 60)
 MAX_RATE_LIMIT_RETRIES = 3
 MAX_RETRY_AFTER = 60
+DEFAULT_EXPORT_TIMEOUT = 900   # seconds to wait for one scan's export to become ready
+DEFAULT_POLL_INTERVAL = 5      # seconds between export status checks
 
 _FAILED_EXPORT_STATUSES = {"error", "failed", "cancelled", "canceled"}
 
@@ -192,15 +198,21 @@ def initiate_export(scan_id, headers):
     return None
 
 
-def wait_for_export(scan_id, file_id, headers, max_retries=30, wait_time=5):
+def wait_for_export(scan_id, file_id, headers, timeout=DEFAULT_EXPORT_TIMEOUT, wait_time=DEFAULT_POLL_INTERVAL):
     """
     Polls the export status until the scan export is ready for download.
 
+    Args:
+        timeout: seconds to keep waiting in total (default 900; large scans can take a while)
+        wait_time: seconds between status checks
+
     Returns:
         True if the export is ready. False if Tenable reports a failed export or
-        max_retries * wait_time seconds pass without it becoming ready.
+        `timeout` seconds pass without it becoming ready.
     """
     status_url = f"{get_base_url()}/scans/{scan_id}/export/{file_id}/status"
+    wait_time = max(wait_time, 1)
+    max_retries = max(1, math.ceil(timeout / wait_time))
     for attempt in range(max_retries):
         try:
             response = request_with_retry("get", status_url, headers=headers)
@@ -216,7 +228,8 @@ def wait_for_export(scan_id, file_id, headers, max_retries=30, wait_time=5):
         except (requests.exceptions.RequestException, ValueError) as e:
             logging.error(f"Error checking export status for scan {scan_id}: {e}")
         time.sleep(wait_time)
-    logging.error(f"Export did not complete for scan {scan_id}. Skipping.")
+    logging.error(f"Export did not complete for scan {scan_id} within {timeout} seconds. "
+                  "Skipping. Raise --export-timeout for very large scans.")
     return False
 
 
@@ -251,7 +264,14 @@ def download_scan(scan_id, scan_name, file_id, headers, output_dir):
         response = request_with_retry("get", download_url, headers=headers, stream=True)
         response.raise_for_status()
 
-        total_size = int(response.headers.get("Content-Length", 0))
+        # Content-Length counts the bytes on the wire. If the body is compressed, requests hands
+        # us the decoded bytes, which are more, so the length cannot be used to check them.
+        encoding = str(response.headers.get("Content-Encoding", "")).strip().lower()
+        compressed = encoding not in ("", "identity")
+        try:
+            total_size = 0 if compressed else int(response.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            total_size = 0
         downloaded_size = 0
         chunk_size = 1024 * 1024  # 1MB chunks
         last_update_time = start_time
@@ -394,7 +414,15 @@ def parse_args(argv):
                         help="scan id to download (repeat for more), no prompts")
     parser.add_argument("--output-dir", default="",
                         help="base folder for the Year/Month/Week folders (default: current folder)")
-    return parser.parse_args(argv)
+    parser.add_argument("--export-timeout", type=int, default=DEFAULT_EXPORT_TIMEOUT, metavar="SECONDS",
+                        help="how long to wait for each scan's export to become ready "
+                             f"(default: {DEFAULT_EXPORT_TIMEOUT})")
+    parser.add_argument("--poll-interval", type=int, default=DEFAULT_POLL_INTERVAL, metavar="SECONDS",
+                        help=f"seconds between export status checks (default: {DEFAULT_POLL_INTERVAL})")
+    args = parser.parse_args(argv)
+    if args.export_timeout < 1 or args.poll_interval < 1:
+        parser.error("--export-timeout and --poll-interval must be at least 1 second")
+    return args
 
 
 def main(argv=None):
@@ -454,7 +482,7 @@ def main(argv=None):
             failures += 1
             continue
 
-        if not wait_for_export(scan_id, file_id, headers) \
+        if not wait_for_export(scan_id, file_id, headers, args.export_timeout, args.poll_interval) \
                 or not download_scan(scan_id, scan_name, file_id, headers, output_dir):
             failures += 1
 

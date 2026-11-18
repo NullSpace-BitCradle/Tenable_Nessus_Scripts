@@ -183,9 +183,57 @@ def test_failed_export_status_stops_polling_early(monkeypatch):
     assert len(get.calls) == 1
 
 
-def test_export_that_never_finishes_times_out(monkeypatch):
+def test_export_that_never_finishes_times_out_after_the_configured_wait(monkeypatch):
     get, _ = patch_http(monkeypatch, get=[FakeResponse(json_data={"status": "loading"})] * 3)
-    assert tsr.wait_for_export(1, 2, {}, max_retries=3, wait_time=0) is False
+    assert tsr.wait_for_export(1, 2, {}, timeout=3, wait_time=1) is False
+    assert len(get.calls) == 3
+
+
+def test_default_wait_is_longer_than_the_old_150_seconds():
+    assert tsr.DEFAULT_EXPORT_TIMEOUT >= 600
+    polls = tsr.DEFAULT_EXPORT_TIMEOUT / tsr.DEFAULT_POLL_INTERVAL
+    assert polls > 30  # the old limit was 30 polls of 5 seconds
+
+
+def test_a_slow_export_that_finishes_after_the_old_limit_is_still_downloaded(monkeypatch):
+    responses = [FakeResponse(json_data={"status": "loading"})] * 40 + [FakeResponse(json_data={"status": "ready"})]
+    get, _ = patch_http(monkeypatch, get=responses)
+    assert tsr.wait_for_export(1, 2, {}) is True
+    assert len(get.calls) == 41
+
+
+def test_export_timeout_option_reaches_the_wait(monkeypatch, tmp_path):
+    monkeypatch.setenv("TENABLE_ACCESS_KEY", "AK")
+    monkeypatch.setenv("TENABLE_SECRET_KEY", "SK")
+    patch_http(monkeypatch,
+               get=[FakeResponse(json_data={"scans": [{"id": 1, "name": "A"}]})],
+               post=[FakeResponse(json_data={"file": 10})])
+    seen = {}
+    monkeypatch.setattr(tsr, "wait_for_export",
+                        lambda sid, fid, h, timeout, wait: seen.update(timeout=timeout, wait=wait) or False)
+    assert tsr.main(["--all", "--export-timeout", "1800", "--poll-interval", "10",
+                     "--output-dir", str(tmp_path)]) == 1
+    assert seen == {"timeout": 1800, "wait": 10}
+
+
+def test_gzip_download_is_not_checked_against_the_compressed_length(monkeypatch, tmp_path):
+    """Content-Length is the compressed size; the decoded body is longer."""
+    body = b"x" * 100
+    patch_http(monkeypatch, get=[FakeResponse(
+        chunks=[body], headers={"Content-Length": "20", "Content-Encoding": "gzip"})])
+    out = tsr.download_scan(5, "Scan", 9, {}, str(tmp_path))
+    assert out and open(out, "rb").read() == body
+
+
+def test_identity_encoding_is_still_length_checked(monkeypatch, tmp_path):
+    patch_http(monkeypatch, get=[FakeResponse(
+        chunks=[b"ab"], headers={"Content-Length": "10", "Content-Encoding": "identity"})])
+    assert tsr.download_scan(5, "Scan", 9, {}, str(tmp_path)) is None
+
+
+def test_a_non_numeric_content_length_does_not_crash(monkeypatch, tmp_path):
+    patch_http(monkeypatch, get=[FakeResponse(chunks=[b"ab"], headers={"Content-Length": "abc"})])
+    assert tsr.download_scan(5, "Scan", 9, {}, str(tmp_path))
 
 
 def test_download_writes_part_then_renames(monkeypatch, tmp_path):
