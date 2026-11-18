@@ -17,15 +17,21 @@ Tables:
 - Name an existing table with --table, or choose one from the menu. The script
   checks that it has every column it needs and stops if it does not.
 - To make a new table, pass --create-table with --table NEW_NAME, or choose
-  "Create a new table" in the menu. The new table gets a unique index on
-  (host_ip, pluginID, port, protocol, scan_date, file_path) that ignores
-  duplicate rows, so importing the same file twice does not add rows twice.
-  Existing tables made by another tool or an older version of this script do not
-  have that index, and re-importing into them adds the rows again.
+  "Create a new table" in the menu.
 - The file_path column holds the file's base name, not a full path.
 
-Each file is imported in one transaction: if any batch of a file fails, nothing
-from that file is kept. A file that cannot be parsed is skipped and reported.
+Re-importing: next to the findings table the script keeps a log table named
+<table>_import_log (created on first use, also for existing tables). It holds
+one row per imported file: the file's base name, the SHA-256 of its bytes and the
+row count. A file whose name and SHA-256 are already in the log is skipped, so
+running the same folder twice adds nothing. A file with the same name but
+different content is imported again in full. No findings table or index drops a
+row by key: a finding is skipped only when all 106 columns equal an earlier row
+in the same run.
+
+Each file is imported in one transaction, rows and log entry together: if any
+batch of a file fails, nothing from that file is kept and it is not logged. A
+file that cannot be parsed is skipped and reported.
 
 Connection: Windows authentication (Trusted_Connection) through ODBC Driver 18.
 The server certificate is validated. If your server uses a self-signed
@@ -36,6 +42,8 @@ any certificate (this lets someone in the network path impersonate the server).
 """
 
 import argparse
+import hashlib
+import os
 import re
 import sys
 import time
@@ -63,9 +71,10 @@ _SHORT_TEXT_COLUMNS = {
     "always_run", "agent", "cisa_known_exploited", "thorough_tests", "unsupported_by_vendor",
     "in_the_news",
 }
-# Columns that make up the unique index; they cannot be MAX.
-_KEY_TYPES = {"host_ip": "NVARCHAR(64)", "protocol": "NVARCHAR(15)", "file_path": "NVARCHAR(255)"}
-UNIQUE_KEY_COLUMNS = ["host_ip", "pluginID", "port", "protocol", "scan_date", "file_path"]
+# Columns with a fixed, bounded size (the file name is at most 255 characters on Windows).
+_KEY_TYPES = {"host_ip": "NVARCHAR(255)", "protocol": "NVARCHAR(100)", "file_path": "NVARCHAR(255)"}
+# Columns that can hold several values joined with ", ".
+MULTI_VALUE_COLUMNS = [c[0] for c in nc.COLUMNS if c[2] == "multi"]
 
 
 def sql_column_name(column):
@@ -142,15 +151,40 @@ def build_connection_string(server, database=None, trust_server_certificate=Fals
 # ---- SQL text ----------------------------------------------------------------
 
 def build_create_table_sql(table):
-    """Return (CREATE TABLE statement, CREATE UNIQUE INDEX statement) for a new table."""
+    """CREATE TABLE statement for a new findings table. It has no unique key on purpose."""
     quoted = quote_identifier(table)
     columns = ",\n    ".join(f"{name} {typ}" for name, typ in SQL_COLUMNS)
-    create_table = f"CREATE TABLE dbo.{quoted} (\n    {columns}\n)"
-    index_name = quote_identifier(f"UX_{table}_finding")
-    key = ", ".join(UNIQUE_KEY_COLUMNS)
-    create_index = (f"CREATE UNIQUE INDEX {index_name} ON dbo.{quoted} ({key}) "
-                    "WITH (IGNORE_DUP_KEY = ON)")
-    return create_table, create_index
+    return f"CREATE TABLE dbo.{quoted} (\n    {columns}\n)"
+
+
+def log_table_name(table):
+    return f"{table}_import_log"
+
+
+LOG_COLUMN_NAMES = ["file_name", "file_sha256", "row_count", "imported_at"]
+
+
+def build_create_log_table_sql(table):
+    """CREATE TABLE statement for the import log that sits next to a findings table."""
+    log = quote_identifier(log_table_name(table))
+    pk = quote_identifier(f"PK_{log_table_name(table)}")
+    return (f"CREATE TABLE dbo.{log} (\n"
+            "    file_name NVARCHAR(255) NOT NULL,\n"
+            "    file_sha256 CHAR(64) NOT NULL,\n"
+            "    row_count INT NOT NULL,\n"
+            "    imported_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),\n"
+            f"    CONSTRAINT {pk} PRIMARY KEY (file_sha256, file_name)\n"
+            ")")
+
+
+def build_log_insert_sql(table):
+    return (f"INSERT INTO dbo.{quote_identifier(log_table_name(table))} "
+            "(file_name, file_sha256, row_count) VALUES (?, ?, ?)")
+
+
+def build_log_lookup_sql(table):
+    return (f"SELECT COUNT(*) FROM dbo.{quote_identifier(log_table_name(table))} "
+            "WHERE file_sha256 = ? AND file_name = ?")
 
 
 def build_insert_sql(table):
@@ -247,12 +281,72 @@ def missing_columns(existing_columns):
     return [c for c in SQL_COLUMN_NAMES if c.lower() not in have]
 
 
+def narrow_multi_value_columns(conn, table):
+    """
+    Names of multi-value columns (cwe, bid, mskb, cve, ...) in an existing table that
+    have a fixed length. Several values joined with ", " can be longer than that, and
+    SQL Server then rejects the whole batch with "String or binary data would be truncated".
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = ?", (table,))
+    rows = cursor.fetchall()
+    cursor.close()
+    lengths = {name.lower(): length for name, length in rows}
+    return [c for c in MULTI_VALUE_COLUMNS
+            if lengths.get(c.lower()) not in (None, -1)]
+
+
+def alter_multi_value_columns_sql(table, columns):
+    quoted = quote_identifier(table)
+    return "\n".join(f"ALTER TABLE dbo.{quoted} ALTER COLUMN {c} NVARCHAR(MAX) NULL;" for c in columns)
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def ensure_log_table(conn, table):
+    """Create <table>_import_log if it is missing; refuse a table of that name that has other columns."""
+    log = log_table_name(table)
+    existing = get_table_columns(conn, log)
+    if existing:
+        have = {c.lower() for c in existing}
+        missing = [c for c in LOG_COLUMN_NAMES if c not in have]
+        if missing:
+            raise ValueError(f"Table dbo.{log} exists but is not an import log "
+                             f"(missing columns: {', '.join(missing)}).")
+        return
+    cursor = conn.cursor()
+    try:
+        cursor.execute(build_create_log_table_sql(table))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+
+
+def is_already_imported(conn, table, file_name, sha256):
+    cursor = conn.cursor()
+    try:
+        cursor.execute(build_log_lookup_sql(table), (sha256, file_name))
+        return cursor.fetchone()[0] > 0
+    finally:
+        cursor.close()
+
+
 def create_table(conn, table):
-    create_table_sql, create_index_sql = build_create_table_sql(table)
+    create_table_sql = build_create_table_sql(table)
     cursor = conn.cursor()
     try:
         cursor.execute(create_table_sql)
-        cursor.execute(create_index_sql)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -284,12 +378,15 @@ def prepare_table(conn, table, create):
     return "created"
 
 
-def import_rows(conn, table, rows, batch_size=BATCH_SIZE):
+def import_rows(conn, table, rows, batch_size=BATCH_SIZE, log=None):
     """
     Insert `rows` into `table` in batches inside one transaction.
 
-    Commits at the end; any error rolls back everything inserted by this call.
-    Returns the number of rows sent.
+    `log` is an optional (file_name, sha256) pair; its import-log row is written in the
+    same transaction, so the rows and the log entry land together or not at all.
+    Commits at the end; any error rolls back everything done by this call.
+    Returns the number of rows inserted (no row is skipped by key, so this equals
+    the rows that landed once the commit succeeded).
     """
     insert_sql = build_insert_sql(table)
     cursor = conn.cursor()
@@ -299,6 +396,8 @@ def import_rows(conn, table, rows, batch_size=BATCH_SIZE):
             batch = [to_sql_row(r) for r in rows[start:start + batch_size]]
             cursor.executemany(insert_sql, batch)
             sent += len(batch)
+        if log is not None:
+            cursor.execute(build_log_insert_sql(table), (log[0], log[1], sent))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -377,12 +476,14 @@ def parse_args(argv):
 
 def _dry_run(args, files):
     table = sanitize_table_name(args.table or DEFAULT_TABLE)
-    create_table_sql, create_index_sql = build_create_table_sql(table)
     print("-- Would run, if the table did not exist:")
-    print(create_table_sql + ";")
-    print(create_index_sql + ";")
+    print(build_create_table_sql(table) + ";")
+    print("\n-- Would run, if the import log did not exist:")
+    print(build_create_log_table_sql(table) + ";")
     print("\n-- Would insert each row with:")
-    print(build_insert_sql(table) + ";\n")
+    print(build_insert_sql(table) + ";")
+    print("\n-- And, per file, in the same transaction:")
+    print(build_log_insert_sql(table) + ";\n")
     stats = nc.RunStats()
     total = sum(1 for _ in nc.iter_unique_rows(files, stats))
     failed = nc.report_failures(stats)
@@ -465,37 +566,63 @@ def main(argv=None, connect_fn=None, input_fn=input):
             print("No table selected. Exiting.", file=sys.stderr)
             return nc.EXIT_FAILED
         try:
+            quote_identifier(f"PK_{log_table_name(table)}")  # name must fit; fail before any change
             state = prepare_table(conn, table, create)
+            ensure_log_table(conn, table)
+            narrow = narrow_multi_value_columns(conn, table) if state == "existing" else []
         except ValueError as exc:
             print(exc, file=sys.stderr)
             return nc.EXIT_FAILED
         print(f"\nProceeding with:\n  Server: {server}\n  Database: {database}\n"
-              f"  Table: dbo.{table} ({state})\n" + "=" * 60)
+              f"  Table: dbo.{table} ({state})\n  Import log: dbo.{log_table_name(table)}\n"
+              + "=" * 60)
+        if narrow:
+            print("WARNING: these columns can hold several joined values but have a fixed length, "
+                  "so a long list (many CVEs, CWEs or MSKB numbers) can make SQL Server reject a "
+                  "batch with 'String or binary data would be truncated':\n  "
+                  + ", ".join(narrow) + "\nWiden them with:\n"
+                  + alter_multi_value_columns_sql(table, narrow) + "\n", file=sys.stderr)
 
         stats = nc.RunStats()
         seen = set()
-        imported = 0
+        landed = 0          # rows committed to the table by this run
+        imported_files = 0
+        skipped_files = []  # already in the import log
         for path in files:
+            file_name = os.path.basename(path)
+            try:
+                sha256 = file_sha256(path)
+            except OSError as exc:
+                stats.files_seen += 1
+                print(f"Error reading {path}: {exc}", file=sys.stderr)
+                stats.failures.append((path, f"cannot read file: {exc}"))
+                continue
+            if is_already_imported(conn, table, file_name, sha256):
+                print(f"Skipping {path}: this file (same name and SHA-256) was already imported.")
+                skipped_files.append(path)
+                continue
             failures_before = len(stats.failures)
             rows = list(nc.iter_unique_rows([path], stats, seen))
             if len(stats.failures) > failures_before:
                 continue
             try:
-                imported += import_rows(conn, table, rows)
+                landed += import_rows(conn, table, rows, log=(file_name, sha256))
             except Exception as exc:
                 print(f"Error importing {path}: {exc}\nNothing from this file was kept "
                       "(rolled back). Stopping.", file=sys.stderr)
                 nc.report_failures(stats)
                 return nc.EXIT_FAILED
+            imported_files += 1
             print(f"Imported {len(rows)} rows from {path}")
     finally:
         conn.close()
 
     failed = nc.report_failures(stats)
-    print(f"Processed {stats.files_ok} of {stats.files_seen} files, {stats.hosts} hosts, "
-          f"{imported} rows sent ({stats.duplicates} duplicates removed before sending).")
+    print(f"{imported_files} file(s) imported, {len(skipped_files)} skipped as already imported, "
+          f"{len(stats.failures)} failed. {landed} rows inserted "
+          f"({stats.duplicates} exact duplicate rows were removed before sending).")
     print(nc.format_run_metrics(start_time))
-    if stats.files_ok == 0:
+    if imported_files == 0 and not skipped_files:
         return nc.EXIT_FAILED
     return nc.EXIT_PARTIAL if failed else nc.EXIT_OK
 

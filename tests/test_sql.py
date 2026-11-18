@@ -26,12 +26,25 @@ class FakeCursor:
             self._rows = [(d,) for d in self.conn.databases]
         elif "INFORMATION_SCHEMA.TABLES" in query:
             self._rows = [(t,) for t in self.conn.tables]
+        elif "CHARACTER_MAXIMUM_LENGTH" in query:
+            lengths = self.conn.column_lengths.get(params[0], {})
+            self._rows = [(c, lengths.get(c, -1)) for c in self.conn.table_columns.get(params[0], [])]
         elif "INFORMATION_SCHEMA.COLUMNS" in query:
             self._rows = [(c,) for c in self.conn.table_columns.get(params[0], [])]
         elif query.lstrip().startswith("CREATE TABLE"):
             name = re.match(r"CREATE TABLE dbo\.\[(.+?)\]", query.lstrip()).group(1)
-            self.conn.table_columns[name] = list(sql.SQL_COLUMN_NAMES)
+            is_log = name.endswith("_import_log")
+            self.conn.table_columns[name] = list(sql.LOG_COLUMN_NAMES if is_log else sql.SQL_COLUMN_NAMES)
             self.conn.tables.append(name)
+        elif "_import_log]" in query and query.lstrip().startswith("SELECT COUNT"):
+            sha, name = params
+            self._rows = [(1 if (sha, name) in self.conn.log_keys else 0,)]
+        elif "_import_log]" in query and query.lstrip().startswith("INSERT"):
+            name, sha, count = params
+            if (sha, name) in self.conn.log_keys or (sha, name) in self.conn.pending_log:
+                raise RuntimeError("Violation of PRIMARY KEY constraint")
+            self.conn.pending_log.append((sha, name))
+            self.conn.log_counts[(sha, name)] = count
 
     def executemany(self, query, batch):
         if self.conn.fail_on_insert_after is not None and \
@@ -42,6 +55,9 @@ class FakeCursor:
 
     def fetchall(self):
         return self._rows
+
+    def fetchone(self):
+        return self._rows[0]
 
     def close(self):
         pass
@@ -54,6 +70,8 @@ class FakeConn:
         self.table_columns = dict(table_columns or {})
         self.executed, self.batches = [], []
         self.pending, self.inserted = [], []
+        self.pending_log, self.log_keys, self.log_counts = [], set(), {}
+        self.column_lengths = {}
         self.commits = self.rollbacks = 0
         self.closed = False
         self.fail_on = None
@@ -66,10 +84,13 @@ class FakeConn:
         self.commits += 1
         self.inserted.extend(self.pending)
         self.pending = []
+        self.log_keys.update(self.pending_log)
+        self.pending_log = []
 
     def rollback(self):
         self.rollbacks += 1
         self.pending = []
+        self.pending_log = []
 
     def close(self):
         self.closed = True
@@ -82,7 +103,7 @@ def good_columns():
 # ---- SQL text ----
 
 def test_create_table_has_106_columns_in_order_and_matches_the_insert():
-    create, index = sql.build_create_table_sql("nessus_findings")
+    create = sql.build_create_table_sql("nessus_findings")
     names = re.findall(r"^\s{4}(\w+) [A-Z]+", create, re.M)
     assert len(names) == 106
     insert = sql.build_insert_sql("nessus_findings")
@@ -94,13 +115,21 @@ def test_create_table_has_106_columns_in_order_and_matches_the_insert():
     assert cols == [("file_path" if c == "file_name" else c) for c in nc.COLUMN_NAMES]
 
 
-def test_create_table_text_is_for_a_new_table_with_a_dedupe_index():
-    create, index = sql.build_create_table_sql("my_scans")
+def test_findings_table_has_no_key_that_could_drop_a_finding():
+    """Audit review B1: a unique index on 6 columns merged distinct findings."""
+    create = sql.build_create_table_sql("my_scans")
     assert create.startswith("CREATE TABLE dbo.[my_scans] (")
-    assert "IF NOT EXISTS" not in create
-    assert index == ("CREATE UNIQUE INDEX [UX_my_scans_finding] ON dbo.[my_scans] "
-                     "(host_ip, pluginID, port, protocol, scan_date, file_path) "
-                     "WITH (IGNORE_DUP_KEY = ON)")
+    for word in ("UNIQUE", "PRIMARY KEY", "IGNORE_DUP_KEY", "INDEX", "IF NOT EXISTS"):
+        assert word not in create
+    assert not hasattr(sql, "UNIQUE_KEY_COLUMNS")
+
+
+def test_import_log_table_is_keyed_on_sha256_and_name():
+    ddl = sql.build_create_log_table_sql("my_scans")
+    assert ddl.startswith("CREATE TABLE dbo.[my_scans_import_log] (")
+    assert "PRIMARY KEY (file_sha256, file_name)" in ddl
+    assert "file_sha256 CHAR(64) NOT NULL" in ddl
+    assert re.findall(r"^\s{4}(\w+) ", ddl, re.M)[:4] == sql.LOG_COLUMN_NAMES
 
 
 def test_column_types_avoid_the_truncation_traps():
@@ -111,13 +140,10 @@ def test_column_types_avoid_the_truncation_traps():
     assert not any(t.startswith("VARCHAR") for t in types.values())
     assert types["port"] == "INT" and types["host_start_timestamp"] == "BIGINT"
     assert types["scan_date"] == "DATE"
-    # The index key must stay under the 900 byte clustered / 1700 byte limit.
-    key_bytes = 0
-    for c in sql.UNIQUE_KEY_COLUMNS:
-        t = types[c]
-        m = re.match(r"NVARCHAR\((\d+)\)", t)
-        key_bytes += int(m.group(1)) * 2 if m else {"INT": 4, "DATE": 3}[t]
-    assert key_bytes < 900
+    # Every multi-value column must be able to hold a long joined list.
+    for c in sql.MULTI_VALUE_COLUMNS:
+        assert types[sql.sql_column_name(c)] == "NVARCHAR(MAX)", c
+    assert "cwe" in sql.MULTI_VALUE_COLUMNS and "mskb" in sql.MULTI_VALUE_COLUMNS
 
 
 # ---- Names ----
@@ -202,13 +228,33 @@ def test_prepare_table_missing_without_create_flag():
         sql.prepare_table(FakeConn(), "new_table", create=False)
 
 
-def test_prepare_table_creates_a_new_table_and_its_index():
+def test_prepare_table_creates_a_new_table_without_an_index():
     conn = FakeConn()
     assert sql.prepare_table(conn, "new_table", create=True) == "created"
     statements = [q.lstrip() for q, _ in conn.executed if q.lstrip().startswith("CREATE")]
-    assert statements[0].startswith("CREATE TABLE dbo.[new_table]")
-    assert statements[1].startswith("CREATE UNIQUE INDEX")
+    assert len(statements) == 1 and statements[0].startswith("CREATE TABLE dbo.[new_table]")
     assert conn.commits == 1
+
+
+def test_ensure_log_table_creates_once_and_rejects_a_lookalike():
+    conn = FakeConn()
+    sql.ensure_log_table(conn, "t")
+    sql.ensure_log_table(conn, "t")
+    creates = [q for q, _ in conn.executed if q.lstrip().startswith("CREATE")]
+    assert len(creates) == 1 and "[t_import_log]" in creates[0]
+    other = FakeConn(tables=["t_import_log"], table_columns={"t_import_log": ["id"]})
+    with pytest.raises(ValueError, match="not an import log"):
+        sql.ensure_log_table(other, "t")
+
+
+def test_narrow_multi_value_columns_are_found_and_the_alter_text_is_built():
+    cols = good_columns()
+    conn = FakeConn(tables=["old"], table_columns={"old": cols})
+    conn.column_lengths["old"] = {"cwe": 150, "bid": 150, "cve": 4000, "mskb": -1}
+    narrow = sql.narrow_multi_value_columns(conn, "old")
+    assert set(narrow) >= {"cwe", "bid", "cve"} and "mskb" not in narrow
+    alter = sql.alter_multi_value_columns_sql("old", ["cwe"])
+    assert alter == "ALTER TABLE dbo.[old] ALTER COLUMN cwe NVARCHAR(MAX) NULL;"
 
 
 def test_prepare_table_validates_a_new_name():
@@ -355,3 +401,106 @@ def test_main_no_server_and_no_input_is_a_clean_error(tmp_path):
         raise EOFError
 
     assert sql.main([str(folder / "a.nessus")], connect_fn=lambda cs: FakeConn(), input_fn=eof) == nc.EXIT_FAILED
+
+
+# ---- Findings that look alike must all land (review B1) ----
+
+def compliance_folder(tmp_path):
+    """Three compliance ReportItems under one plugin on one host, differing only in the text,
+    plus a host with no host-ip tag whose two items also differ only in the text."""
+    from helpers import report_host
+    items = [report_item("21156", "Windows Compliance Checks", sev, port="0",
+                         children=[("description", f'"1.1.{n} check" : [{res}]')])
+             for n, sev, res in ((1, 3, "FAILED"), (2, 1, "PASSED"), (3, 3, "FAILED"))]
+    no_ip = [report_item("21156", "Windows Compliance Checks", 3, port="0",
+                         children=[("description", f"no ip check {n}")]) for n in (1, 2)]
+    folder = tmp_path / "compliance"
+    folder.mkdir()
+    write_nessus(folder / "compliance.nessus", [
+        basic_host("10.0.0.5", items=items),
+        report_host("noip-host", [("HOST_START", "Thu Apr  4 10:23:11 2024")], no_ip)])
+    return folder
+
+
+def run_import(folder, conn, *extra):
+    return sql.main(["--server", "s", "--database", "d", "--table", "findings", "--create-table",
+                     *extra, str(folder)], connect_fn=lambda cs: conn,
+                    input_fn=lambda p: pytest.fail("should not prompt"))
+
+
+def test_all_compliance_findings_land_and_the_message_counts_rows_that_landed(tmp_path, capsys):
+    conn = FakeConn()
+    assert run_import(compliance_folder(tmp_path), conn) == nc.EXIT_OK
+    assert len(conn.inserted) == 5
+    descriptions = [r[sql.SQL_COLUMN_NAMES.index("description")] for r in conn.inserted]
+    assert len(set(descriptions)) == 5
+    out = capsys.readouterr().out
+    assert "5 rows inserted" in out and "1 file(s) imported" in out
+
+
+def test_importing_the_same_folder_twice_adds_nothing(tmp_path, capsys):
+    folder = compliance_folder(tmp_path)
+    conn = FakeConn()
+    assert run_import(folder, conn) == nc.EXIT_OK
+    capsys.readouterr()
+    assert run_import(folder, conn) == nc.EXIT_OK
+    assert len(conn.inserted) == 5
+    out = capsys.readouterr().out
+    assert "already imported" in out and "0 file(s) imported, 1 skipped" in out and "0 rows inserted" in out
+
+
+def test_a_changed_file_with_the_same_name_is_imported_again(tmp_path):
+    folder = compliance_folder(tmp_path)
+    conn = FakeConn()
+    run_import(folder, conn)
+    write_nessus(folder / "compliance.nessus", [basic_host("10.0.0.9", items=[report_item("1")])])
+    assert run_import(folder, conn) == nc.EXIT_OK
+    assert len(conn.inserted) == 6
+    assert len(conn.log_keys) == 2
+
+
+def test_same_content_under_another_name_is_a_separate_import(tmp_path):
+    folder = compliance_folder(tmp_path)
+    (folder / "copy.nessus").write_bytes((folder / "compliance.nessus").read_bytes())
+    conn = FakeConn()
+    assert run_import(folder, conn) == nc.EXIT_OK
+    assert len(conn.inserted) == 10  # file_path differs, so these are different rows
+
+
+def test_a_failed_import_is_not_logged_so_a_rerun_retries_it(tmp_path):
+    folder = compliance_folder(tmp_path)
+    conn = FakeConn()
+    conn.fail_on_insert_after = 0
+    assert run_import(folder, conn) == nc.EXIT_FAILED
+    assert conn.inserted == [] and conn.log_keys == set()
+    conn.fail_on_insert_after = None
+    assert run_import(folder, conn) == nc.EXIT_OK
+    assert len(conn.inserted) == 5
+
+
+def test_a_failing_log_write_rolls_the_rows_back_too(tmp_path):
+    folder = compliance_folder(tmp_path)
+    conn = FakeConn()
+    # Make the log INSERT fail; the findings batch before it must not stay.
+    conn.fail_on = "INSERT INTO dbo.[findings_import_log]"
+    assert run_import(folder, conn) == nc.EXIT_FAILED
+    assert conn.inserted == [] and conn.rollbacks >= 1
+
+
+def test_main_warns_about_narrow_columns_in_an_old_table(tmp_path, capsys):
+    folder = compliance_folder(tmp_path)
+    conn = FakeConn(tables=["findings"], table_columns={"findings": good_columns()})
+    conn.column_lengths["findings"] = {"cwe": 150, "mskb": 150}
+    code = sql.main(["--server", "s", "--database", "d", "--table", "findings", str(folder)],
+                    connect_fn=lambda cs: conn)
+    assert code == nc.EXIT_OK
+    err = capsys.readouterr().err
+    assert "ALTER TABLE dbo.[findings] ALTER COLUMN cwe NVARCHAR(MAX) NULL;" in err
+    assert "String or binary data would be truncated" in err
+
+
+def test_dry_run_shows_the_import_log_sql(tmp_path, capsys):
+    folder = compliance_folder(tmp_path)
+    assert sql.main(["--dry-run", "--table", "dry", str(folder)]) == nc.EXIT_OK
+    out = capsys.readouterr().out
+    assert "CREATE TABLE dbo.[dry_import_log]" in out and "5 rows would be inserted" in out
