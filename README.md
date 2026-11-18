@@ -35,7 +35,7 @@ pip install -r requirements.txt
 `nessus_to_sql.py` requires:
 - Windows with ODBC Driver 18 for SQL Server installed
 - Windows Authentication (Trusted Connection) to the target SQL Server
-- Permission to insert data, and to create a table and index if you want the script to create the table
+- Permission to insert data and to create tables: the import log (always) and the findings table (if you ask the script to create it)
 
 ## Usage
 
@@ -54,7 +54,7 @@ python tenable_scan_retrieval.py --all --output-dir D:\scans
 2. Select scans: with no options, enter a single number, comma-separated numbers, or "all". `--all` and `--scan-id` skip the prompt.
 3. Files are saved as `<scan name>-<scan id>.nessus` in `Year/MM-MonthName/Week-XX/` under `--output-dir` (default: the current folder). Year and week are both ISO values, so 2027-01-01 goes in `2026/01-January/Week-53`.
 
-Every request has a timeout (10 s to connect, 60 s to read). A rate-limited request (HTTP 429) is retried up to 3 times. Each download goes to a `.part` file and is renamed only when complete. To use another Tenable cloud, set `TENABLE_URL` (https only), for example `https://fedcloud.tenable.com`. The exit code is `1` if any selected scan failed.
+Every request has a timeout (10 s to connect, 60 s to read). A rate-limited request (HTTP 429) is retried up to 3 times. Each download goes to a `.part` file and is renamed only when complete; the size is checked against `Content-Length` unless the response is compressed, where that length does not apply. Each scan's export is polled every 5 seconds for up to 900 seconds. Use `--export-timeout SECONDS` and `--poll-interval SECONDS` to change that for very large scans. To use another Tenable cloud, set `TENABLE_URL` (https only), for example `https://fedcloud.tenable.com`. The exit code is `1` if any selected scan failed.
 
 ### Convert to CSV
 
@@ -88,8 +88,11 @@ python nessus_to_sql.py D:\scans --dry-run               # print the SQL and row
 
 1. Give a folder or files (or none, to get a folder picker).
 2. Give the server, database and table on the command line, or answer the prompts. The table menu lists the existing `dbo` tables and a "Create a new table" choice that asks for a name.
-3. An existing table must already have all the script's columns, or the script stops before inserting. To create a table, use `--create-table` with `--table NAME`, or choose it in the menu. A new table gets a unique index on `(host_ip, pluginID, port, protocol, scan_date, file_path)` that ignores duplicate rows, so importing the same file twice does not add its rows twice. A table made some other way has no such index, and importing the same file again adds the rows again.
-4. Each file is imported in one transaction, in batches of 500,000 rows. If a batch fails, nothing from that file is kept and the run stops.
+3. An existing table must already have all the script's columns, or the script stops before inserting. To create a table, use `--create-table` with `--table NAME`, or choose it in the menu. The findings table has no unique key, so no finding is ever dropped for looking like another one (compliance checks, for instance, share a plugin ID, host and port and differ only in their text). The script skips a row only when all 106 columns equal an earlier row in the same run.
+4. Next to the findings table the script keeps `<table>_import_log` (created on first use, for existing tables too, so the login needs permission to create it). It records each imported file's base name, its SHA-256 and its row count. A file whose name and SHA-256 are already logged is skipped, so running the same folder twice adds nothing. A file with the same name but different content is imported again in full, and the same content under a different name is a separate import (the `file_path` value differs). Delete a row from the log to force a file to be imported again.
+5. Each file is imported in one transaction together with its log row, in batches of 500,000 rows. If a batch fails, nothing from that file is kept, it is not logged, and the run stops. The closing message counts rows inserted by this run, files imported and files skipped.
+
+Tables built by the old version of this script (before this change) have `VARCHAR(150)` columns for `cwe`, `bid`, `mskb` and the other reference columns, and `NVARCHAR(4000)` for `cve`. A finding with many references makes the joined text longer than that, and SQL Server then rejects the whole batch with "String or binary data would be truncated". When you point the script at such a table it prints a warning with the `ALTER TABLE ... ALTER COLUMN ... NVARCHAR(MAX)` statements for the narrow columns. Run those once, or import into a new table. The column check looks at names only, not types.
 
 The `file_path` column holds the file's base name (for example `scan1.nessus`), not a full path. The CSV and Excel outputs call the same value File Name.
 
