@@ -1,0 +1,3 @@
+# Test dependencies. The tests do not need pyodbc or a display.
+-r requirements.txt
+pytest>=7.0,<10
