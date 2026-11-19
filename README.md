@@ -16,7 +16,7 @@ All three converters accept files or folders on the command line, support multip
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.11+
 - A graphical display only if you run a converter with no path (tkinter file dialogs need a desktop environment or X11 forwarding)
 
 ```bash
