@@ -3,13 +3,13 @@
 # Each entry has a floor and a ceiling at the next major version.
 
 # System and process monitoring
-psutil>=5.9.0,<8
+psutil>=7.2.2,<8
 
 # SQL Server database connectivity (for nessus_to_sql.py)
-pyodbc>=4.0.39,<6
+pyodbc>=5.5.0,<6
 
 # Excel file creation (for nessus_to_xlsx.py)
-openpyxl>=3.1.0,<4
+openpyxl>=3.1.5,<4
 
 # HTTP requests for Tenable.io API (for tenable_scan_retrieval.py)
-requests>=2.31.0,<3
+requests>=2.34.2,<3
